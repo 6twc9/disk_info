@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Darwin
 
 /// Represents a mounted volume / disk on macOS
 struct VolumeInfo: Identifiable, Hashable {
@@ -24,7 +25,6 @@ struct VolumeInfo: Identifiable, Hashable {
         let keys: [URLResourceKey] = [
             .volumeNameKey,
             .volumeTotalCapacityKey,
-            .volumeAvailableCapacityForImportantUsageKey,
             .volumeAvailableCapacityKey,
             .volumeIsInternalKey,
             .volumeIsRemovableKey,
@@ -32,28 +32,36 @@ struct VolumeInfo: Identifiable, Hashable {
         ]
 
         guard let urls = FileManager.default.mountedVolumeURLs(
-            includingResourceValuesForKeys: keys,
+            includingResourceValuesForKeys: nil,
             options: [.skipHiddenVolumes]
         ) else {
             return []
         }
 
         var volumes: [VolumeInfo] = []
-        for url in urls {
-            guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
-            let name = values.volumeName ?? url.lastPathComponent
-            let total = Int64(values.volumeTotalCapacity ?? 0)
+        for rawURL in urls {
+            var url = rawURL
+            url.removeAllCachedResourceValues()
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            let name = values?.volumeName ?? (url.path == "/" ? "Macintosh HD" : url.lastPathComponent)
+
+            // Query kernel filesystem directly via statfs to avoid stale URLResourceValues / cachedelete caching
+            var fs = statfs()
+            var total: Int64 = 0
+            var available: Int64 = 0
+            if statfs(url.path, &fs) == 0 {
+                let blockSize = Int64(fs.f_bsize)
+                total = Int64(fs.f_blocks) * blockSize
+                available = Int64(fs.f_bavail) * blockSize
+            }
+            if total <= 0 {
+                total = Int64(values?.volumeTotalCapacity ?? 0)
+                available = Int64(values?.volumeAvailableCapacity ?? 0)
+            }
             guard total > 0 else { continue }
 
-            let available: Int64
-            if let importantAvail = values.volumeAvailableCapacityForImportantUsage, importantAvail > 0 {
-                available = Int64(importantAvail)
-            } else {
-                available = Int64(values.volumeAvailableCapacity ?? 0)
-            }
-
-            let isInternal = values.volumeIsInternal ?? (url.path == "/")
-            let isRemovable = values.volumeIsRemovable ?? false
+            let isInternal = values?.volumeIsInternal ?? (url.path == "/")
+            let isRemovable = values?.volumeIsRemovable ?? false
 
             volumes.append(VolumeInfo(
                 name: name,
@@ -65,7 +73,6 @@ struct VolumeInfo: Identifiable, Hashable {
             ))
         }
 
-        // Also offer User Home directory as a quick target
         return volumes
     }
 }

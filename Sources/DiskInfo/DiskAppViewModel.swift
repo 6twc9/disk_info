@@ -34,6 +34,7 @@ final class DiskAppViewModel: ObservableObject {
     @Published var hoveredNode: DiskNode?
     @Published var searchQuery: String = ""
     @Published var visualizationMode: VisualizationMode = .sunburst
+    @Published var scannedTargetSizes: [String: Int64] = [:]
 
     // DaisyDisk-style Collector (Basket for staged deletion)
     @Published var collectorItems: [DiskNode] = []
@@ -43,15 +44,36 @@ final class DiskAppViewModel: ObservableObject {
     private var activeScanner: FastDiskScanner?
     private var progressTimer: Timer?
     private var scanStartTime: Date?
+    private var appActiveObserver: NSObjectProtocol?
 
     init() {
         refreshVolumes()
+        appActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshVolumes()
+            }
+        }
     }
 
     func refreshVolumes() {
         volumes = VolumeInfo.fetchMountedVolumes()
         if selectedTargetURL == nil {
             selectedTargetURL = volumes.first?.url
+        }
+    }
+
+    /// Refresh volume capacities immediately and again after APFS asynchronous extent reaping completes
+    func refreshVolumesWithAPFSDelay() {
+        refreshVolumes()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.refreshVolumes()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.refreshVolumes()
         }
     }
 
@@ -73,6 +95,7 @@ final class DiskAppViewModel: ObservableObject {
 
     func startScan(url: URL) {
         cancelScan()
+        refreshVolumes()
 
         selectedTargetURL = url
         isScanning = true
@@ -119,7 +142,9 @@ final class DiskAppViewModel: ObservableObject {
                     self.scannedBytesCount = root.size
                     self.scannedFilesCount = root.fileCount
                     self.permissionDeniedCount = result.permissionDeniedCount
+                    self.scannedTargetSizes[targetPath] = root.size
                 }
+                self.refreshVolumesWithAPFSDelay()
             }
         }
     }
@@ -227,26 +252,63 @@ final class DiskAppViewModel: ObservableObject {
         guard !collectorItems.isEmpty else { return }
 
         let alert = NSAlert()
-        alert.messageText = "確定要將 \(collectorItems.count) 個項目移至垃圾桶嗎？"
+        alert.messageText = "確定要清理收集籃中的 \(collectorItems.count) 個項目嗎？"
         let totalStr = ByteCountFormatter.string(fromByteCount: collectorTotalBytes, countStyle: .file)
-        alert.informativeText = "預計可釋放 \(totalStr) 的磁碟空間。項目將移至 macOS 垃圾桶，需要時仍可還原。"
+        alert.informativeText = """
+        預計可處理 \(totalStr) 的空間：
+        • 「立即永久刪除」：直接從磁碟移除檔案，立即釋放硬碟可用空間（不可還原）。
+        • 「移至垃圾桶」：移至 macOS 垃圾桶（需清空垃圾桶後系統才會釋放硬碟空間）。
+        """
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "移至垃圾桶 (釋放 \(totalStr))")
+        alert.addButton(withTitle: "立即永久刪除 (直接釋放 \(totalStr))")
+        alert.addButton(withTitle: "移至垃圾桶")
+        alert.addButton(withTitle: "取消")
+
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn || response == .alertSecondButtonReturn else { return }
+        let isPermanent = (response == .alertFirstButtonReturn)
+
+        performDeletion(items: collectorItems, permanently: isPermanent)
+        collectorItems.removeAll()
+    }
+
+    func deleteSingleNode(_ node: DiskNode, permanently: Bool) {
+        guard !node.isAggregatedSmallerItems else { return }
+        if node.path == "/" || node.path == "/System" || node.path == "/Applications" || node.path == "/Users" {
+            showToast("系統核心目錄受保護，不可刪除")
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = permanently ? "確定要永久刪除「\(node.name)」嗎？" : "確定要將「\(node.name)」移至垃圾桶嗎？"
+        alert.informativeText = permanently
+            ? "此操作將直接從磁碟永久移除該項目（\(node.formattedSize)），並立即釋放磁碟空間，無法復原。"
+            : "此項目（\(node.formattedSize)）將移至 macOS 垃圾桶，清空垃圾桶後即可釋放硬碟空間。"
+        alert.alertStyle = permanently ? .critical : .warning
+        alert.addButton(withTitle: permanently ? "立即永久刪除 (\(node.formattedSize))" : "移至垃圾桶")
         alert.addButton(withTitle: "取消")
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        performDeletion(items: [node], permanently: permanently)
+        removeFromCollector(node)
+    }
 
+    private func performDeletion(items: [DiskNode], permanently: Bool) {
         var deletedCount = 0
         var freedBytes: Int64 = 0
         var failedNames: [String] = []
 
-        for item in collectorItems {
+        for item in items {
             let fileURL = URL(fileURLWithPath: item.path)
             do {
-                try FileManager.default.trashItem(at: fileURL, resultingItemURL: nil)
+                if permanently {
+                    try FileManager.default.removeItem(at: fileURL)
+                } else {
+                    try FileManager.default.trashItem(at: fileURL, resultingItemURL: nil)
+                }
                 deletedCount += 1
                 freedBytes += item.size
-                // Update in-memory tree immediately so charts reflect freed space
+                // Update in-memory tree immediately so charts and sidebar reflect freed space
                 if focusedNode?.id == item.id {
                     focusedNode = item.parent ?? rootNode
                 }
@@ -256,14 +318,24 @@ final class DiskAppViewModel: ObservableObject {
             }
         }
 
-        collectorItems.removeAll()
-        refreshVolumes()
+        if let root = rootNode {
+            scannedBytesCount = root.size
+            scannedFilesCount = root.fileCount
+            scannedTargetSizes[root.path] = root.size
+        }
+
+        objectWillChange.send()
+        refreshVolumesWithAPFSDelay()
 
         let freedStr = ByteCountFormatter.string(fromByteCount: freedBytes, countStyle: .file)
         if failedNames.isEmpty {
-            showToast("成功將 \(deletedCount) 個項目移至垃圾桶，已釋放 \(freedStr)！")
+            if permanently {
+                showToast("已永久刪除 \(deletedCount) 個項目，立即釋放 \(freedStr) 空間！")
+            } else {
+                showToast("已將 \(deletedCount) 個項目移至垃圾桶 (\(freedStr))")
+            }
         } else {
-            showToast("已釋放 \(freedStr)，但有 \(failedNames.count) 項因權限不足無法刪除")
+            showToast("已處理 \(freedStr)，但有 \(failedNames.count) 項因權限不足無法刪除")
         }
     }
 

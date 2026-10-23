@@ -108,6 +108,18 @@ struct MainDiskView: View {
                         url: homeURL
                     )
 
+                    // Active Custom Folder Card (if user picked a custom folder other than mounted volumes or ~)
+                    if let targetURL = viewModel.selectedTargetURL,
+                       targetURL != homeURL,
+                       !viewModel.volumes.contains(where: { $0.url == targetURL }) {
+                        quickFolderButton(
+                            title: targetURL.lastPathComponent.isEmpty ? targetURL.path : targetURL.lastPathComponent,
+                            subtitle: targetURL.path,
+                            icon: "folder.fill",
+                            url: targetURL
+                        )
+                    }
+
                     // Choose Any Custom Folder
                     Button {
                         viewModel.selectCustomFolder()
@@ -173,6 +185,7 @@ struct MainDiskView: View {
         let usedStr = ByteCountFormatter.string(fromByteCount: vol.usedCapacity, countStyle: .file)
         let availStr = ByteCountFormatter.string(fromByteCount: vol.availableCapacity, countStyle: .file)
         let totalStr = ByteCountFormatter.string(fromByteCount: vol.totalCapacity, countStyle: .file)
+        let scannedBytes = viewModel.scannedTargetSizes[vol.url.path]
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
@@ -210,14 +223,21 @@ struct MainDiskView: View {
             .frame(height: 6)
 
             HStack {
-                Text("已使用 \(usedStr) (\(Int(vol.usedFraction * 100))%)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("已使用 \(usedStr) (\(Int(vol.usedFraction * 100))%)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    if let scannedBytes = scannedBytes {
+                        Text("實測掃描：\(ByteCountFormatter.string(fromByteCount: scannedBytes, countStyle: .file))")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.cyan)
+                    }
+                }
                 Spacer()
                 Button {
                     viewModel.startScan(url: vol.url)
                 } label: {
-                    Text(isSelected && viewModel.rootNode != nil ? "重新掃描" : "掃描")
+                    Text((isSelected && viewModel.rootNode != nil) || scannedBytes != nil ? "重新掃描" : "掃描")
                         .font(.system(size: 11, weight: .semibold))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 3)
@@ -244,6 +264,7 @@ struct MainDiskView: View {
 
     private func quickFolderButton(title: String, subtitle: String, icon: String, url: URL) -> some View {
         let isSelected = (viewModel.selectedTargetURL == url)
+        let scannedBytes = viewModel.scannedTargetSizes[url.path]
         return Button {
             viewModel.startScan(url: url)
         } label: {
@@ -260,9 +281,14 @@ struct MainDiskView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if let scannedBytes = scannedBytes {
+                        Text("已使用：\(ByteCountFormatter.string(fromByteCount: scannedBytes, countStyle: .file))")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.cyan)
+                    }
                 }
                 Spacer()
-                Text("掃描")
+                Text(scannedBytes != nil ? "重新掃描" : "掃描")
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(.cyan)
             }
@@ -735,7 +761,19 @@ struct MainDiskView: View {
                 Button {
                     viewModel.addToCollector(item)
                 } label: {
-                    Label("加入清理收集籃 (Collector)", systemImage: "trash")
+                    Label("加入清理收集籃 (Collector)", systemImage: "plus.circle")
+                }
+
+                Button {
+                    viewModel.deleteSingleNode(item, permanently: false)
+                } label: {
+                    Label("移至垃圾桶…", systemImage: "trash")
+                }
+
+                Button(role: .destructive) {
+                    viewModel.deleteSingleNode(item, permanently: true)
+                } label: {
+                    Label("立即永久刪除 (直接釋放空間)…", systemImage: "trash.slash.fill")
                 }
             }
         }
@@ -846,7 +884,7 @@ struct MainDiskView: View {
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "trash")
-                            Text("移至垃圾桶 (釋放 \(ByteCountFormatter.string(fromByteCount: viewModel.collectorTotalBytes, countStyle: .file)))")
+                            Text("清理項目 (釋放 \(ByteCountFormatter.string(fromByteCount: viewModel.collectorTotalBytes, countStyle: .file)))")
                                 .fontWeight(.bold)
                         }
                         .font(.system(size: 12))

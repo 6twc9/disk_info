@@ -142,6 +142,16 @@ final class FastDiskScanner: @unchecked Sendable {
 
     private func listEntries(at dirPath: String, rootDev: dev_t, isScanningRoot: Bool) -> [RawEntry] {
         guard let dir = opendir(dirPath) else {
+            // macOS external volumes set `.Trashes` to mode 0311 (-wx--x--t), which blocks opendir(".Trashes")
+            // while still allowing access to `.Trashes/<uid>`.
+            if (dirPath as NSString).lastPathComponent == ".Trashes" {
+                let uidStr = String(getuid())
+                let userTrashPath = "\(dirPath)/\(uidStr)"
+                var st = stat()
+                if lstat(userTrashPath, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR {
+                    return [RawEntry(name: "\(uidStr) (垃圾桶)", path: userTrashPath, isDirectory: true, size: 0)]
+                }
+            }
             if errno == EACCES || errno == EPERM {
                 addStats(files: 0, bytes: 0, denied: 1)
             }
