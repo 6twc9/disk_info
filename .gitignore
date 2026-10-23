@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager & Build Artifacts
+.build/
+.swiftpm/
+Packages/
+xcuserdata/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+
+# Packaged App Bundle
+DiskInfo.app/
+*.app/
+*.pkg
+*.dmg
